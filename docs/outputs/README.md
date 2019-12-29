@@ -288,6 +288,7 @@ types:
 - memcached
 - memory
 - redis
+- redis_hybrid
 - s3
 
 Like follows:
