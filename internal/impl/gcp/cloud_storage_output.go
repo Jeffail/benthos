@@ -3,6 +3,7 @@ package gcp
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/Jeffail/benthos/v3/lib/output"
 	"github.com/Jeffail/benthos/v3/lib/output/writer"
 	"github.com/Jeffail/benthos/v3/lib/types"
+	"github.com/gofrs/uuid"
 )
 
 func init() {
@@ -191,17 +193,49 @@ func (g *gcpCloudStorageOutput) WriteWithContext(ctx context.Context, msg types.
 			return nil
 		})
 
-		w := client.Bucket(g.conf.Bucket).Object(g.path.String(i, msg)).NewWriter(ctx)
+		path := g.path.String(i, msg)
+		_, err := client.Bucket(g.conf.Bucket).Object(path).Attrs(ctx)
+
+		isMerge := false
+		var tempPath string
+		if err == storage.ErrObjectNotExist {
+			tempPath = path
+		} else {
+			isMerge = true
+			tempUUID, err := uuid.NewV4()
+			if err != nil {
+				return err
+			}
+
+			dir := filepath.Dir(path)
+			tempFileName := fmt.Sprintf("%s.tmp", tempUUID.String())
+			tempPath = filepath.Join(dir, tempFileName)
+		}
+
+		w := client.Bucket(g.conf.Bucket).Object(tempPath).NewWriter(ctx)
+
 		w.ChunkSize = g.conf.ChunkSize
 		w.ContentType = g.contentType.String(i, msg)
 		w.ContentEncoding = g.contentEncoding.String(i, msg)
 		w.Metadata = metadata
-		_, err := w.Write(p.Get())
+		_, err = w.Write(p.Get())
 		if err != nil {
 			return err
 		}
 
-		return w.Close()
+		err = w.Close()
+		if err != nil {
+			return err
+		}
+
+		if isMerge {
+			err = g.appendToFile(path, tempPath, path)
+			if err != nil {
+				return err
+			}
+		}
+
+		return err
 	})
 }
 
@@ -220,5 +254,27 @@ func (g *gcpCloudStorageOutput) CloseAsync() {
 // WaitForClose will block until either the reader is closed or a specified
 // timeout occurs.
 func (g *gcpCloudStorageOutput) WaitForClose(time.Duration) error {
+	return nil
+}
+
+func (g *gcpCloudStorageOutput) appendToFile(source1, source2, dest string) error {
+	client := g.client
+	bucket := client.Bucket(g.conf.Bucket)
+	src1 := bucket.Object(source1)
+	src2 := bucket.Object(source2)
+	dst := bucket.Object(dest)
+
+	ctx := context.Background()
+	_, err := dst.ComposerFrom(src1, src2).Run(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Remove the temporary file used for the merge
+	err = src2.Delete(ctx)
+	if err != nil {
+		g.log.Errorf("error deleting temp file in gcp: %w", err)
+	}
+
 	return nil
 }
